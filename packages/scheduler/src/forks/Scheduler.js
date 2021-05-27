@@ -14,8 +14,16 @@ import {
 } from '../SchedulerFeatureFlags';
 
 import {push, pop, peek} from '../SchedulerMinHeap';
+// push 向小顶堆末尾添加元素 并重新排序
+// pop  从小顶堆弹出首个元素
+// peek 返回（并不删除）首个元素
+// 我们此次只需要了解他的大小比较规则即可，优先计算sortIndex，再比较进入队列的顺序
+// function compare(a, b) {
+//   // Compare sort index first, then task id.
+//   const diff = a.sortIndex - b.sortIndex;
+//   return diff !== 0 ? diff : a.id - b.id;
+// }
 
-// TODO: Use symbols?
 import {
   ImmediatePriority,
   UserBlockingPriority,
@@ -66,8 +74,8 @@ var LOW_PRIORITY_TIMEOUT = 10000;
 var IDLE_PRIORITY_TIMEOUT = maxSigned31BitInt;
 
 // Tasks are stored on a min heap
-var taskQueue = [];
-var timerQueue = [];
+var taskQueue = []; // 已到任务开始时间，立即执行的任务队列
+var timerQueue = []; // 未到任务开始时间，延迟执行的任务队列
 
 // Incrementing id counter. Used to maintain insertion order.
 var taskIdCounter = 1;
@@ -79,9 +87,12 @@ var currentTask = null;
 var currentPriorityLevel = NormalPriority;
 
 // This is set while performing work, to prevent re-entrancy.
+// 是否正在执行任务
 var isPerformingWork = false;
 
+// 是否调度了taskQueue，isHostCallbackScheduled=true后才把时间片放到宏任务队列，之后开始执行任务isPerformingWork才设置为true，isHostCallbackScheduled设置为false
 var isHostCallbackScheduled = false;
+// 是否调度了timerQueue（设置了timeout回调）
 var isHostTimeoutScheduled = false;
 
 // Capture local references to native APIs, in case a polyfill overrides them.
@@ -91,6 +102,7 @@ const localClearTimeout =
 const localSetImmediate =
   typeof setImmediate !== 'undefined' ? setImmediate : null; // IE and Node.js + jsdom
 
+// 调整任务顺序。 依据任务开始时间，由 timerQueue 流向 taskQueue 
 function advanceTimers(currentTime) {
   // Check for tasks that are no longer delayed and add them to the queue.
   let timer = peek(timerQueue);
@@ -115,15 +127,18 @@ function advanceTimers(currentTime) {
   }
 }
 
+// 每间隔一段时间 就检测是否有过期任务
 function handleTimeout(currentTime) {
   isHostTimeoutScheduled = false;
   advanceTimers(currentTime);
 
   if (!isHostCallbackScheduled) {
     if (peek(taskQueue) !== null) {
+      // 如果已有任务且现在是空闲的，说明之前的advanceTimers已经将过期任务放到了taskQueue，那么现在立即开始调度，执行任务
       isHostCallbackScheduled = true;
       requestHostCallback(flushWork);
     } else {
+      // 如果没有，说明之前的advanceTimers并没有检查到timerQueue中有过期任务，那么再次调用requestHostTimeout重复这一过程
       const firstTimer = peek(timerQueue);
       if (firstTimer !== null) {
         requestHostTimeout(handleTimeout, firstTimer.startTime - currentTime);
@@ -132,7 +147,7 @@ function handleTimeout(currentTime) {
   }
 }
 
-function flushWork(hasTimeRemaining, initialTime) {
+function flushWork(remaining, initialTime) {
   if (enableProfiling) {
     markSchedulerUnsuspended(initialTime);
   }
@@ -150,7 +165,7 @@ function flushWork(hasTimeRemaining, initialTime) {
   try {
     if (enableProfiling) {
       try {
-        return workLoop(hasTimeRemaining, initialTime);
+        return workLoop(remaining, initialTime);
       } catch (error) {
         if (currentTask !== null) {
           const currentTime = getCurrentTime();
@@ -161,7 +176,7 @@ function flushWork(hasTimeRemaining, initialTime) {
       }
     } else {
       // No catch in prod code path.
-      return workLoop(hasTimeRemaining, initialTime);
+      return workLoop(remaining, initialTime);
     }
   } finally {
     currentTask = null;
@@ -174,7 +189,7 @@ function flushWork(hasTimeRemaining, initialTime) {
   }
 }
 
-function workLoop(hasTimeRemaining, initialTime) {
+function workLoop(rename, initialTime) {
   let currentTime = initialTime;
   advanceTimers(currentTime);
   currentTask = peek(taskQueue);
@@ -184,11 +199,13 @@ function workLoop(hasTimeRemaining, initialTime) {
   ) {
     if (
       currentTask.expirationTime > currentTime &&
-      (!hasTimeRemaining || shouldYieldToHost())
+      (!rename || shouldYieldToHost())
     ) {
       // This currentTask hasn't expired, and we've reached the deadline.
       break;
     }
+
+    // *** 执行任务 ***
     const callback = currentTask.callback;
     if (typeof callback === 'function') {
       currentTask.callback = null;
@@ -198,6 +215,7 @@ function workLoop(hasTimeRemaining, initialTime) {
         markTaskRun(currentTask, currentTime);
       }
       const continuationCallback = callback(didUserCallbackTimeout);
+      // 检查callback的返回值，如果返回的是函数，说明单个任务还没有执行结束，将这个函数作为当前任务新的回调
       currentTime = getCurrentTime();
       if (typeof continuationCallback === 'function') {
         currentTask.callback = continuationCallback;
@@ -217,12 +235,16 @@ function workLoop(hasTimeRemaining, initialTime) {
     } else {
       pop(taskQueue);
     }
+    // *** 获取下一个任务，继续循环 ***
     currentTask = peek(taskQueue);
   }
-  // Return whether there's additional work
+  // 如果currentTask不为空，说明是时间片的限制导致了任务中断
+  // return true 表示任务还未执行完，还有任务
   if (currentTask !== null) {
     return true;
   } else {
+    // 如果currentTask为空，说明taskQueue队列中的任务已执行完毕，告诉外部终止任务调度
+    // 然后从timerQueue中找任务，如果有的话，到指定时间后再次发起调度
     const firstTimer = peek(timerQueue);
     if (firstTimer !== null) {
       requestHostTimeout(handleTimeout, firstTimer.startTime - currentTime);
@@ -296,6 +318,7 @@ function unstable_wrapCallback(callback) {
 function unstable_scheduleCallback(priorityLevel, callback, options) {
   var currentTime = getCurrentTime();
 
+  // startTime理解为 用户侧设定的预期执行时间。 如果没有设置延迟，认为需立刻执行，推入到 taskQueue 中
   var startTime;
   if (typeof options === 'object' && options !== null) {
     var delay = options.delay;
@@ -328,6 +351,8 @@ function unstable_scheduleCallback(priorityLevel, callback, options) {
       break;
   }
 
+  // 对于 startTime 相同的任务, scheduler 会优先处理 expirationTime 较低的任务
+  // 作为任务的最后执行期限，如果当前时间未到达任务的最后执行期限，那么任务就可以不被执行
   var expirationTime = startTime + timeout;
 
   var newTask = {
@@ -342,6 +367,7 @@ function unstable_scheduleCallback(priorityLevel, callback, options) {
     newTask.isQueued = false;
   }
 
+  // 设置了延迟 进入延迟调度队列 timerQueue
   if (startTime > currentTime) {
     // This is a delayed task.
     newTask.sortIndex = startTime;
@@ -492,12 +518,14 @@ function forceFrameRate(fps) {
   }
 }
 
+// 按照时间片的限制去中断任务，并通知调度者再次调度一个新的执行者去继续任务
 const performWorkUntilDeadline = () => {
   if (scheduledHostCallback !== null) {
     const currentTime = getCurrentTime();
     // Yield after `yieldInterval` ms, regardless of where we are in the vsync
     // cycle. This means there's always time remaining at the beginning of
     // the message event.
+    // 计算deadline，deadline会参与到 shouldYieldToHost（根据时间片去限制任务执行）的计算中
     deadline = currentTime + yieldInterval;
     const hasTimeRemaining = true;
 
